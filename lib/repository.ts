@@ -212,6 +212,25 @@ async function commitAll(db: Firestore, ops: BatchOp[]) {
 /** Invitations are keyed by lowercased email — see firestore.rules. */
 export const emailKey = (email: string) => email.trim().toLowerCase();
 
+/** A stored document of unknown vintage. */
+type Legacy = Record<string, unknown>;
+
+/*
+ * Which shape a stored document is in, decided by what it actually contains
+ * rather than by a version flag that may not have kept up. A version 4 record
+ * belongs to a shed and remembers the unit it was typed in; a version 4 sale
+ * holds an egg count and a price in paise.
+ */
+const isCurrentRecord = (r: Legacy) =>
+  typeof r.shedId === 'string' &&
+  r.shedId !== '' &&
+  typeof r.feedKg === 'number';
+
+const isCurrentSale = (s: Legacy) =>
+  typeof s.shedId === 'string' &&
+  s.shedId !== '' &&
+  typeof s.unitPriceMinor === 'number';
+
 /**
  * Resolve this user's farm.
  *
@@ -322,30 +341,90 @@ export function cloudRepository(uid: string, email: string): Repository {
         getDocs(collection(db, 'farms', fid, 'records')),
         getDocs(collection(db, 'farms', fid, 'sales')),
       ]).catch(explainLoadFailure);
+
       const stored = farmSnap.data() ?? {};
-      const version = (stored.version as number) ?? VERSION;
-      const data = {
-        version,
-        sample: Boolean(stored.sample),
-        settings: {
-          name: (stored.name as string) ?? 'My farm',
-          traySize: (stored.traySize as number) ?? 30,
-          // A farm saved before version 4 kept its opening balances on the
-          // farm, not the shed. Carry them through so the migration can move
-          // them onto the shed it creates instead of silently zeroing them.
-          ...(version < VERSION
-            ? {
-                openingStock: (stored.openingStock as number) ?? 0,
-                openingBirds: (stored.openingBirds as number) ?? 0,
-              }
-            : {}),
-        },
-        sheds: sheds.docs.map((d) => d.data() as Shed),
-        records: records.docs.map((d) => d.data() as RecordDay),
-        sales: sales.docs.map((d) => d.data() as Sale),
-      };
+      const rawRecords = records.docs.map((d) => d.data() as Legacy);
+      const rawSales = sales.docs.map((d) => d.data() as Legacy);
+
+      /*
+       * The farm document carries a version, but its subcollections are
+       * written one document at a time and can outrun it: a farm created
+       * before version 4 still says 3 while every record saved since is
+       * already in version 4 shape. Trusting that flag re-ran the migration
+       * over migrated data and blew up on the missing fields.
+       *
+       * So shape is decided per document, and the flag is only a fallback for
+       * the farm's own settings.
+       */
+      const legacyRecords = rawRecords.filter((r) => !isCurrentRecord(r));
+      const legacySales = rawSales.filter((s) => !isCurrentSale(s));
+      const needsMigration =
+        legacyRecords.length > 0 ||
+        legacySales.length > 0 ||
+        ((stored.version as number) ?? VERSION) < VERSION;
+
+      let data: Farm;
+      if (!needsMigration) {
+        data = {
+          version: VERSION,
+          sample: Boolean(stored.sample),
+          settings: {
+            name: (stored.name as string) ?? 'My farm',
+            traySize: (stored.traySize as number) ?? 30,
+          },
+          sheds: sheds.docs.map((d) => d.data() as Shed),
+          records: rawRecords as unknown as RecordDay[],
+          sales: rawSales as unknown as Sale[],
+        };
+      } else {
+        // Migrate only what is actually old, then fold the rest back in.
+        const migrated = validateData({
+          version: 3,
+          sample: Boolean(stored.sample),
+          settings: {
+            name: (stored.name as string) ?? 'My farm',
+            traySize: (stored.traySize as number) ?? 30,
+            // Opening balances lived on the farm before version 4.
+            openingStock: (stored.openingStock as number) ?? 0,
+            openingBirds: (stored.openingBirds as number) ?? 0,
+          },
+          records: legacyRecords,
+          sales: legacySales,
+        }) as Farm;
+        data = {
+          ...migrated,
+          sheds: [
+            ...sheds.docs.map((d) => d.data() as Shed),
+            // The migration invents a shed only when it had rows to house.
+            ...migrated.sheds.filter(
+              (s) => !sheds.docs.some((d) => d.id === s.id),
+            ),
+          ],
+          records: [
+            ...migrated.records,
+            ...(rawRecords.filter(isCurrentRecord) as unknown as RecordDay[]),
+          ],
+          sales: [
+            ...migrated.sales,
+            ...(rawSales.filter(isCurrentSale) as unknown as Sale[]),
+          ],
+        };
+      }
+
       // The same validator guards cloud data as guards a restored backup.
-      return { data: validateData(data) as Farm, notice: '' };
+      const validated = validateData(data) as Farm;
+
+      // Stamp the farm as current so this never has to be worked out again.
+      // Best effort: a viewer cannot write, and that must not block a load.
+      if (((stored.version as number) ?? 0) !== VERSION)
+        updateDoc(doc(db, 'farms', fid), { version: VERSION }).catch(() => {});
+
+      return {
+        data: validated,
+        notice: needsMigration
+          ? 'Your records have been brought up to date and are now organised by shed. Check each shed’s capacity and stage in Sheds.'
+          : '',
+      };
     },
 
     async save(next, prev) {
