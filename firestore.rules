@@ -1,0 +1,232 @@
+rules_version = '2';
+
+// Flockbook access model.
+//
+// A farm is the unit of isolation. Every record and sale lives beneath the
+// farm document, and membership on that document is the only thing that grants
+// access. Roles: owner (full control, including membership), editor (may write
+// records and sales), viewer (read only).
+//
+// These rules are the real boundary. The browser validates the same values for
+// a better error message, but nothing here trusts the client to have done so.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function farm(farmId) {
+      return get(/databases/$(database)/documents/farms/$(farmId)).data;
+    }
+    function role(farmId) {
+      return farm(farmId).members[request.auth.uid];
+    }
+    function member(farmId) {
+      return signedIn() && request.auth.uid in farm(farmId).members;
+    }
+    function editor(farmId) {
+      return member(farmId) && role(farmId) in ['owner', 'editor'];
+    }
+    function owner(farmId) {
+      return member(farmId) && role(farmId) == 'owner';
+    }
+
+    // Invitations are keyed by lowercased email, because that is the only
+    // thing an invited person knows about themselves before they have a farm.
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+    function invitePath(email) {
+      return /databases/$(database)/documents/invites/$(email);
+    }
+    function hasInvite() {
+      return signedIn()
+        && request.auth.token.email != null
+        && exists(invitePath(myEmail()));
+    }
+    function myInvite() {
+      return get(invitePath(myEmail())).data;
+    }
+
+    /**
+     * An invited person adds themselves to a farm, and may change nothing else
+     * about it. The role comes from the invitation, never from the request, so
+     * a viewer cannot let themselves in as an editor.
+     */
+    function joiningByInvite(farmId) {
+      return hasInvite()
+        && myInvite().farmId == farmId
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['members', 'memberEmails'])
+        && request.resource.data.members.diff(resource.data.members)
+             .affectedKeys().hasOnly([request.auth.uid])
+        && request.resource.data.members[request.auth.uid] == myInvite().role;
+    }
+
+    function wholeNumber(value, max) {
+      return value is int && value >= 0 && value <= max;
+    }
+    // Character classes rather than \d: backslash escapes are not valid inside
+    // a rules string literal, and this needs no escaping at all.
+    function isDate(value) {
+      return value is string && value.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+    function isStage(value) {
+      return value in ['brooding', 'growing', 'early_production',
+                       'production', 'not_producing', 'empty'];
+    }
+    function isLaying(value) {
+      return value in ['early_production', 'production'];
+    }
+    function isReason(value) {
+      return value in ['disease', 'moulting', 'old_age', 'cleaning',
+                       'between_batches', 'other'];
+    }
+    // A quantity as the user typed it, alongside the canonical egg count.
+    function isEntry(value) {
+      return value is map
+        && value.qty is int && value.qty >= 0
+        && value.unit in ['egg', 'tray'];
+    }
+
+    // Which farm a signed-in user opens. Readable and writable only by them.
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+
+    /**
+     * Pending invitations, keyed by lowercased email.
+     *
+     * An invited person can read only their own, which is what lets them find
+     * the farm before they belong to it. Nobody can list them, so this is not
+     * a directory of who uses the product.
+     */
+    match /invites/{emailKey} {
+      allow get: if signedIn()
+        && ((request.auth.token.email != null && emailKey == myEmail())
+            || owner(resource.data.farmId));
+      allow list: if false;
+
+      allow create, update: if signedIn()
+        && request.resource.data.farmId is string
+        && owner(request.resource.data.farmId)
+        && request.resource.data.role in ['editor', 'viewer']
+        && request.resource.data.email == emailKey
+        && emailKey.size() <= 320;
+
+      // An owner revokes, or the invited person clears their own once used.
+      allow delete: if signedIn()
+        && ((request.auth.token.email != null && emailKey == myEmail())
+            || owner(resource.data.farmId));
+    }
+
+    match /farms/{farmId} {
+      // A new farm must name its creator as owner, so nobody can create a farm
+      // that already belongs to someone else.
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.members[request.auth.uid] == 'owner';
+
+      allow read: if member(farmId);
+
+      // Ownership can never be reassigned by an update, and only an owner may
+      // change who the members are. The exception is an invited person adding
+      // themselves, which `joiningByInvite` constrains tightly.
+      allow update: if (editor(farmId)
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          // An owner may never demote or remove themselves, or a farm could be
+          // left with nobody able to manage it.
+          && (request.resource.data.members == resource.data.members
+              || (owner(farmId)
+                  && request.resource.data.members[resource.data.ownerUid] == 'owner'))
+          // Membership and invitations are an owner's business alone.
+          && (request.resource.data.get('pendingInvites', {})
+                == resource.data.get('pendingInvites', {})
+              || owner(farmId))
+          && (request.resource.data.get('memberEmails', {})
+                == resource.data.get('memberEmails', {})
+              || owner(farmId)))
+        || joiningByInvite(farmId);
+
+      allow delete: if owner(farmId);
+
+      // A shed is the unit of record. Everything below belongs to one.
+      match /sheds/{shedId} {
+        allow read: if member(farmId);
+        allow delete: if editor(farmId);
+        allow create, update: if editor(farmId)
+          && request.resource.data.id == shedId
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 60
+          && request.resource.data.code is string
+          && request.resource.data.code.size() > 0
+          && request.resource.data.code.size() <= 10
+          && request.resource.data.capacity is int
+          && request.resource.data.capacity > 0
+          && isStage(request.resource.data.stage)
+          // A shed that is not producing must say why.
+          && (request.resource.data.stage != 'not_producing'
+              || isReason(request.resource.data.notProducingReason))
+          && wholeNumber(request.resource.data.openingBirds, 100000000)
+          && wholeNumber(request.resource.data.openingEggs, 100000000)
+          && request.resource.data.archived is bool;
+      }
+
+      // Keyed by shed and date, which makes one record per shed per day a
+      // structural guarantee rather than a client-side check.
+      match /records/{recordId} {
+        allow read: if member(farmId);
+        allow delete: if editor(farmId);
+        allow create, update: if editor(farmId)
+          && recordId == request.resource.data.shedId + '__' + request.resource.data.date
+          && isDate(request.resource.data.date)
+          && isStage(request.resource.data.stage)
+          && wholeNumber(request.resource.data.birds, 100000000)
+          && wholeNumber(request.resource.data.eggs, 100000000)
+          && wholeNumber(request.resource.data.damaged, 100000000)
+          && wholeNumber(request.resource.data.deaths, 100000000)
+          && wholeNumber(request.resource.data.added, 100000000)
+          // Only a laying shed may record eggs.
+          && (request.resource.data.eggs == 0 || isLaying(request.resource.data.stage))
+          && request.resource.data.feedKg is number
+          && request.resource.data.feedKg >= 0
+          && isEntry(request.resource.data.entry)
+          && request.resource.data.notes is string
+          && request.resource.data.notes.size() <= 1000;
+      }
+
+      match /sales/{saleId} {
+        allow read: if member(farmId);
+        allow delete: if editor(farmId);
+        allow create, update: if editor(farmId)
+          && request.resource.data.id == saleId
+          && isDate(request.resource.data.date)
+          && request.resource.data.shedId is string
+          && request.resource.data.shedId.size() > 0
+          && request.resource.data.customer is string
+          && request.resource.data.customer.size() > 0
+          && request.resource.data.customer.size() <= 100
+          // Quantities are canonical egg counts, money is integer paise.
+          && request.resource.data.eggs is int
+          && request.resource.data.eggs > 0
+          && request.resource.data.unitPriceMinor is int
+          && request.resource.data.unitPriceMinor > 0
+          && request.resource.data.priceUnit in ['egg', 'tray']
+          && isEntry(request.resource.data.entry)
+          && request.resource.data.discountPercent is number
+          && request.resource.data.discountPercent >= 0
+          && request.resource.data.discountPercent <= 100
+          && request.resource.data.notes is string
+          && request.resource.data.notes.size() <= 1000;
+      }
+    }
+
+    // Anything not matched above is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

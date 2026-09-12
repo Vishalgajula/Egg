@@ -14,94 +14,102 @@ import {
   TableRow,
   TableCell,
 } from '@/components/ui/table';
-import { dateKey, saleAmount, salesTotals } from '@/lib/farm.mjs';
-import { saleFromInputs } from '@/lib/sale-inputs.mjs';
-import { NativeSelect } from '@/components/ui/native-select';
+import { dateKey } from '@/lib/farm.mjs';
+import { saleAmountMinor, formatMinor, fromMinor } from '@/lib/units.mjs';
+import { salesTotals } from '@/lib/sheds.mjs';
+import { saleFromInputs } from '@/lib/inputs.mjs';
+import { NumberField, UnitToggle } from '@/components/fields';
+import type { Sale, Shed } from '@/lib/repository';
 
-export type Sale = {
-  id: string;
-  date: string;
-  customer: string;
-  trays: number;
-  pricePerTray: number;
-  discountPercent: number;
-  notes: string;
-  priceUnit?: 'tray' | 'egg';
-};
-const money = (n: number) =>
-  n.toLocaleString('en-IN', {
-    style: 'currency',
-    currency: 'INR',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
 const fmt = (n: number) => n.toLocaleString('en-IN');
+const niceDate = (s: string) =>
+  new Date(s + 'T12:00:00').toLocaleDateString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+
+/** Describe a stored sale in the unit it was entered in. */
+export function describeQuantity(sale: Sale, traySize: number) {
+  if (sale.entry?.unit === 'tray') {
+    // The tray size in force at entry is recoverable, so a sale still reads
+    // correctly after the farm changes its tray size.
+    const size = sale.entry.qty > 0 ? sale.eggs / sale.entry.qty : traySize;
+    return `${fmt(sale.entry.qty)} ${sale.entry.qty === 1 ? 'tray' : 'trays'}${
+      size !== traySize ? ` of ${size}` : ''
+    }`;
+  }
+  return `${fmt(sale.eggs)} eggs`;
+}
 
 export function SaleDialog({
   initial,
   existing,
+  sheds,
   traySize,
-  stock,
+  stockOf,
   onClose,
   onSave,
 }: {
   initial: Sale;
   existing: boolean;
+  sheds: Shed[];
   traySize: number;
-  stock: number;
+  stockOf: (shedId: string) => number;
   onClose: () => void;
   onSave: (sale: Sale) => void;
 }) {
   const [draft, setDraft] = useState(initial);
+  const [qtyUnit, setQtyUnit] = useState<'tray' | 'egg'>(
+    initial.entry?.unit ?? 'tray',
+  );
   const [priceUnit, setPriceUnit] = useState<'tray' | 'egg'>(
     initial.priceUnit ?? 'tray',
   );
-  const [traysText, setTraysText] = useState(String(initial.trays));
+  const [qtyText, setQtyText] = useState(
+    initial.entry ? String(initial.entry.qty) : '',
+  );
   const [priceText, setPriceText] = useState(
-    String(
-      initial.priceUnit === 'egg'
-        ? Number((initial.pricePerTray / traySize).toFixed(2))
-        : initial.pricePerTray,
-    ),
+    initial.unitPriceMinor ? String(fromMinor(initial.unitPriceMinor)) : '',
   );
   const [discountText, setDiscountText] = useState(
-    String(initial.discountPercent),
+    String(initial.discountPercent ?? 0),
   );
   const [error, setError] = useState('');
+
+  const inputs = {
+    qty: qtyText,
+    qtyUnit,
+    price: priceText,
+    priceUnit,
+    discount: discountText,
+  };
   let preview: Sale | null = null;
   try {
-    preview = saleFromInputs(
-      draft,
-      {
-        trays: traysText,
-        price: priceText,
-        discount: discountText,
-        unit: priceUnit,
-      },
-      traySize,
-    );
+    preview = saleFromInputs(draft, inputs, traySize) as Sale;
   } catch {
     /* Incomplete fields stay blank while editing. */
   }
+
+  const available = draft.shedId ? stockOf(draft.shedId) : 0;
+
   function submit(e: SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     try {
       onSave(
         saleFromInputs(
           { ...draft, customer: draft.customer.trim() },
-          {
-            trays: traysText,
-            price: priceText,
-            discount: discountText,
-            unit: priceUnit,
-          },
+          inputs,
           traySize,
-        ),
+        ) as Sale,
       );
     } catch (e) {
       setError((e as Error).message);
     }
   }
+
+  const amounts = preview ? saleAmountMinor(preview, traySize) : null;
+
   return (
     <Dialog
       open
@@ -114,9 +122,28 @@ export function SaleDialog({
           {existing ? 'Edit customer sale' : 'Record a sale'}
         </DialogTitle>
         <DialogDescription>
-          One customer, one entry. Add as many sales as you need each day.
+          One customer, one entry. Eggs come out of the shed you choose.
         </DialogDescription>
         <form onSubmit={submit}>
+          <label htmlFor="sale-shed">
+            Shed the eggs came from
+            <select
+              id="sale-shed"
+              required
+              value={draft.shedId}
+              onChange={(e) => setDraft({ ...draft, shedId: e.target.value })}
+            >
+              <option value="" disabled>
+                Choose a shed…
+              </option>
+              {sheds.map((shed) => (
+                <option key={shed.id} value={shed.id}>
+                  {shed.code} · {shed.name} — {fmt(stockOf(shed.id))} eggs in
+                  store
+                </option>
+              ))}
+            </select>
+          </label>
           <label>
             Customer name
             <input
@@ -139,99 +166,87 @@ export function SaleDialog({
                 onChange={(e) => setDraft({ ...draft, date: e.target.value })}
               />
             </label>
-            <label>
-              Trays sold
-              <input
-                type="number"
-                min="1"
-                step="1"
-                required
-                value={traysText}
-                onChange={(e) => setTraysText(e.target.value)}
-              />
-            </label>
-            <label htmlFor="sale-pricing-unit">
-              Pricing unit
-              <NativeSelect
-                id="sale-pricing-unit"
-                className="mt-2 w-full [&_select]:h-[41px] [&_select]:text-base"
-                aria-label="Pricing unit"
-                value={priceUnit}
-                onChange={(e) => {
-                  setPriceUnit(e.target.value as 'tray' | 'egg');
-                  setPriceText('');
-                  setError('');
-                }}
-              >
-                <option value="tray">Price per tray</option>
-                <option value="egg">Price per egg</option>
-              </NativeSelect>
-            </label>
-            <label>
-              {priceUnit === 'egg' ? 'Price per egg (₹)' : 'Price per tray (₹)'}
-              <input
-                type="number"
-                min="0.01"
-                step="0.01"
-                required
-                value={priceText}
-                onChange={(e) => setPriceText(e.target.value)}
-              />
-            </label>
-            <label>
-              Discount (%)
-              <input
-                type="number"
-                min="0"
-                max="100"
-                step="0.01"
-                required
-                value={discountText}
-                onChange={(e) => setDiscountText(e.target.value)}
-              />
-            </label>
+            <NumberField
+              label={qtyUnit === 'tray' ? 'Trays sold' : 'Eggs sold'}
+              value={qtyText}
+              onChange={setQtyText}
+              min="1"
+            />
           </div>
+          <UnitToggle
+            label="Quantity unit"
+            value={qtyUnit}
+            options={[
+              { value: 'tray', label: 'Count in trays' },
+              { value: 'egg', label: 'Count in eggs' },
+            ]}
+            onChange={(next) => {
+              setQtyUnit(next);
+              setQtyText('');
+              setError('');
+            }}
+          />
+          <div className="form-grid">
+            <NumberField
+              label={
+                priceUnit === 'egg' ? 'Price per egg (₹)' : 'Price per tray (₹)'
+              }
+              value={priceText}
+              onChange={setPriceText}
+              decimals
+              min="0.01"
+            />
+            <NumberField
+              label="Discount (%)"
+              value={discountText}
+              onChange={setDiscountText}
+              decimals
+            />
+          </div>
+          <UnitToggle
+            label="Pricing unit"
+            value={priceUnit}
+            options={[
+              { value: 'tray', label: 'Price per tray' },
+              { value: 'egg', label: 'Price per egg' },
+            ]}
+            onChange={(next) => {
+              setPriceUnit(next);
+              setPriceText('');
+              setError('');
+            }}
+          />
           <p className="field-note">
-            Choose either price unit. Changing the unit clears the price for a
-            new rate. {traySize} eggs = 1 tray.
+            Count and price can each use either unit. Changing a unit clears its
+            field so you can enter a fresh figure. {traySize} eggs = 1 tray.
           </p>
-          {preview ? (
+          {preview && amounts ? (
             <div className="sale-receipt">
               <div>
                 <span>
-                  {priceUnit === 'egg'
-                    ? `${fmt(preview.trays * traySize)} eggs × ${money(Number(priceText))}`
-                    : `${fmt(preview.trays)} trays × ${money(preview.pricePerTray)}`}
+                  {describeQuantity(preview, traySize)} ·{' '}
+                  {formatMinor(preview.unitPriceMinor)} per {preview.priceUnit}
                 </span>
-                <strong>{money(preview.trays * preview.pricePerTray)}</strong>
+                <strong>{formatMinor(amounts.grossMinor)}</strong>
               </div>
               <div>
                 <span>Customer discount ({preview.discountPercent}%)</span>
-                <span>
-                  −
-                  {money(
-                    preview.trays * preview.pricePerTray - saleAmount(preview),
-                  )}
-                </span>
+                <span>−{formatMinor(amounts.discountMinor)}</span>
               </div>
               <div className="receipt-total">
                 <span>Sale total</span>
-                <strong>{money(saleAmount(preview))}</strong>
+                <strong>{formatMinor(amounts.netMinor)}</strong>
               </div>
               <p>
-                {fmt(preview.trays * traySize)} eggs ·{' '}
-                {money(preview.pricePerTray)} per tray · Net{' '}
-                {money(
-                  (preview.pricePerTray * (1 - preview.discountPercent / 100)) /
-                    traySize,
-                )}{' '}
+                {fmt(preview.eggs)} eggs leaving this shed ·{' '}
+                {formatMinor(Math.round(amounts.netMinor / preview.eggs))} net
                 per egg
               </p>
             </div>
           ) : (
             <div className="sale-receipt">
               <p>
-                Enter trays, price, and discount to calculate the sale total.
+                Enter quantity, price and discount to calculate the sale total.
               </p>
             </div>
           )}
@@ -245,8 +260,9 @@ export function SaleDialog({
             />
           </label>
           <p className="field-note">
-            Current stock: {fmt(stock)} eggs. Availability is checked on the
-            sale date, including all other sales that day.
+            {draft.shedId
+              ? `This shed holds ${fmt(available)} eggs today. Availability is checked on the sale date, including other sales that day.`
+              : 'Choose a shed to see what it has in store.'}
           </p>
           {error && (
             <p className="form-error" role="alert">
@@ -274,23 +290,30 @@ export function SaleDialog({
 
 export function SalesPanel({
   sales,
+  sheds,
   traySize,
+  canEdit,
   onEdit,
   onDelete,
   onAdd,
 }: {
   sales: Sale[];
+  sheds: Shed[];
   traySize: number;
+  canEdit: boolean;
   onEdit: (sale: Sale) => void;
   onDelete: (sale: Sale) => void;
   onAdd: () => void;
 }) {
   const [page, setPage] = useState(1);
-  const total = salesTotals(sales);
-  const currentPage = Math.min(page, Math.max(1, Math.ceil(sales.length / 12)));
+  const total = salesTotals(sales, traySize);
+  const pages = Math.max(1, Math.ceil(sales.length / 12));
+  const currentPage = Math.min(page, pages);
   const rows = [...sales]
     .sort((a, b) => b.date.localeCompare(a.date))
     .slice((currentPage - 1) * 12, currentPage * 12);
+  const shedLabel = (id: string) => sheds.find((s) => s.id === id)?.code ?? '—';
+
   function exportSales() {
     const cell = (v: string | number) =>
       `"${String(v)
@@ -299,26 +322,28 @@ export function SalesPanel({
     const csv = [
       [
         'Date',
+        'Shed',
         'Customer',
-        'Trays',
-        'Price per tray (INR)',
-        'Entered pricing unit',
-        'Entered rate (INR)',
+        'Eggs',
+        'Entered quantity',
+        'Entered unit',
+        'Price (INR)',
+        'Price unit',
         'Discount (%)',
         'Total (INR)',
         'Notes',
       ],
       ...sales.map((s) => [
         s.date,
+        shedLabel(s.shedId),
         s.customer,
-        s.trays,
-        s.pricePerTray,
-        s.priceUnit ?? 'tray',
-        s.priceUnit === 'egg'
-          ? Number((s.pricePerTray / traySize).toFixed(2))
-          : s.pricePerTray,
+        s.eggs,
+        s.entry?.qty ?? s.eggs,
+        s.entry?.unit ?? 'egg',
+        fromMinor(s.unitPriceMinor),
+        s.priceUnit,
         s.discountPercent,
-        saleAmount(s),
+        fromMinor(saleAmountMinor(s, traySize).netMinor),
         s.notes,
       ]),
     ]
@@ -333,14 +358,15 @@ export function SalesPanel({
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
+
   return (
     <>
       <div className="sales-stats">
         {[
           { label: 'Customer sales', value: fmt(total.count) },
-          { label: 'Trays sold', value: fmt(total.trays) },
-          { label: 'Discounts given', value: money(total.discount) },
-          { label: 'Sales after discount', value: money(total.amount) },
+          { label: 'Eggs sold', value: fmt(total.eggs) },
+          { label: 'Discounts given', value: formatMinor(total.discountMinor) },
+          { label: 'Sales after discount', value: formatMinor(total.netMinor) },
         ].map((x) => (
           <article className="panel" key={x.label}>
             <span>{x.label}</span>
@@ -365,8 +391,9 @@ export function SalesPanel({
               <TableHeader>
                 <TableRow>
                   <TableHead>Date</TableHead>
+                  <TableHead>Shed</TableHead>
                   <TableHead>Customer</TableHead>
-                  <TableHead>Trays</TableHead>
+                  <TableHead>Quantity</TableHead>
                   <TableHead>Price</TableHead>
                   <TableHead>Discount</TableHead>
                   <TableHead>Sale total</TableHead>
@@ -378,45 +405,45 @@ export function SalesPanel({
               <TableBody>
                 {rows.map((s) => (
                   <TableRow key={s.id}>
+                    <TableCell>{niceDate(s.date)}</TableCell>
                     <TableCell>
-                      {new Date(s.date + 'T12:00:00').toLocaleDateString(
-                        'en-GB',
-                        { day: 'numeric', month: 'short', year: 'numeric' },
-                      )}
+                      <span className="shed-chip">{shedLabel(s.shedId)}</span>
                     </TableCell>
                     <TableCell className="customer-cell">
                       <strong>{s.customer}</strong>
                       {s.notes && <small>{s.notes}</small>}
                     </TableCell>
-                    <TableCell>{fmt(s.trays)}</TableCell>
+                    <TableCell>{describeQuantity(s, traySize)}</TableCell>
                     <TableCell>
-                      {s.priceUnit === 'egg'
-                        ? `${money(s.pricePerTray / traySize)} / egg`
-                        : `${money(s.pricePerTray)} / tray`}
+                      {formatMinor(s.unitPriceMinor)} / {s.priceUnit}
                     </TableCell>
                     <TableCell>
                       {s.discountPercent ? `${s.discountPercent}%` : '—'}
                     </TableCell>
                     <TableCell>
-                      <strong>{money(saleAmount(s))}</strong>
+                      <strong>
+                        {formatMinor(saleAmountMinor(s, traySize).netMinor)}
+                      </strong>
                     </TableCell>
                     <TableCell>
-                      <div className="row-actions">
-                        <button
-                          className="icon-button"
-                          aria-label={`Edit sale to ${s.customer} on ${s.date}`}
-                          onClick={() => onEdit(s)}
-                        >
-                          <Pencil size={16} />
-                        </button>
-                        <button
-                          className="icon-button"
-                          aria-label={`Delete sale to ${s.customer} on ${s.date}`}
-                          onClick={() => onDelete(s)}
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      </div>
+                      {canEdit && (
+                        <div className="row-actions">
+                          <button
+                            className="icon-button"
+                            aria-label={`Edit sale to ${s.customer} on ${s.date}`}
+                            onClick={() => onEdit(s)}
+                          >
+                            <Pencil size={16} />
+                          </button>
+                          <button
+                            className="icon-button"
+                            aria-label={`Delete sale to ${s.customer} on ${s.date}`}
+                            onClick={() => onDelete(s)}
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -424,8 +451,7 @@ export function SalesPanel({
             </Table>
             <div className="pagination">
               <span>
-                Page {currentPage} of{' '}
-                {Math.max(1, Math.ceil(sales.length / 12))}
+                Page {currentPage} of {pages}
               </span>
               <button
                 className="secondary-button"
@@ -450,9 +476,11 @@ export function SalesPanel({
             <p>
               Add a sale for each customer, even when they buy on the same day.
             </p>
-            <button className="primary" onClick={onAdd}>
-              Record a sale
-            </button>
+            {canEdit && (
+              <button className="primary" onClick={onAdd}>
+                Record a sale
+              </button>
+            )}
           </div>
         )}
       </section>
